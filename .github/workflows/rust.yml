@@ -12,27 +12,81 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build_test_and_release:
-    runs-on: ubuntu-latest
+  install_dependencies:
+    runs-on: ubuntu-20.04
+    steps:
+    
+    - name: Install cross
+      run: cargo install cross --git https://github.com/cross-rs/cross
+    
+    - name: Cache dependencies
+      uses: actions/cache@v4.0.2
+      with:
+        path: ~/.cargo/bin
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-
+
+  build_and_test:
+    needs: install_dependencies
+    runs-on: ubuntu-20.04
     permissions:
       contents: write
+    strategy:
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
     steps:
     - uses: actions/checkout@v4.1.1
-    - name: Install dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y zlib1g-dev libelf-dev
+
+    - name: Restore dependencies from cache
+      uses: actions/cache@v4.0.2
+      with:
+        path: ~/.cargo/bin
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-
+
     - name: Test
-      run: cargo test
-    - name: clippy
-      run: cargo clippy --all --tests --all-features --no-deps
+      run: cross test --target ${{ matrix.target }}
+
+    - name: Clippy
+      run: cross clippy --target ${{ matrix.target }} --all --tests --all-features --no-deps
+
     - name: Build
-      run: cargo build --release
-    - name: Create Release and Upload Artficat
+      run: cross build --target ${{ matrix.target }} --release
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4.3.3
+      with:
+        name: bpftop-${{ matrix.target }}
+        path: target/${{ matrix.target }}/release/bpftop
+        if-no-files-found: error
+  
+  build_rpm_and_release:
+    needs: build_and_test
+    runs-on: ubuntu-20.04
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+    - uses: actions/checkout@v4.1.1
+    
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4.1.7
+      with:
+        pattern: bpftop-*
+        path: artifacts
+        merge-multiple: true
+    
+    - name: Build RPM
+      run: ./build-rpm.sh
+
+    - name: Create Release and Upload Artifacts
       uses: ncipollo/release-action@v1.14.0
       if: startsWith(github.ref, 'refs/tags/v')
       with:
-        artifacts: "target/release/bpftop"
+        artifacts: "artifacts/*,bpftop-*.rpm"
         draft: true
         allowUpdates: true
         updateOnlyUnreleased: true

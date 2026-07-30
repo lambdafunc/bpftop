@@ -4,12 +4,24 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: monthly
+    groups:
+      github-actions:
+        patterns: ["*"]
   - package-ecosystem: "cargo"
     directory: "/"
     schedule:
       interval: "weekly"
+    open-pull-requests-limit: 0
     ignore:
-      # These are peer deps of Cargo and should not be automatically bumped
-      - dependency-name: "semver"
-      - dependency-name: "crates-io"
+      # Only security updates for Rust dependencies
+      - dependency-name: "*"
+        update-types: ["version-update:semver-patch", "version-update:semver-minor", "version-update:semver-major"]
+      # Ghost dep: ratatui's optional termwiz backend pulls in
+      # phf 0.11 -> phf_generator -> rand 0.8. We don't enable
+      # termwiz, so rand is never compiled. See cargo#10801.
+      - dependency-name: "rand"
     rebase-strategy: "disabled"

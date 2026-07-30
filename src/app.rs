@@ -1,6 +1,7 @@
 /**
  *
- *  Copyright 2024 Netflix, Inc.
+ *  Copyright 2024-2026 Netflix, Inc.
+ *  Copyright 2026-Present Jose Fernandez and bpftop contributors.
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -15,9 +16,13 @@
  *  limitations under the License.
  *
  */
-use crate::bpf_program::{BpfProgram, Process};
-use circular_buffer::CircularBuffer;
+use crate::{
+    bpf_program::{BpfProgram, Process},
+    helpers::program_type_as_str,
+};
+use circular_buffer::FixedCircularBuffer;
 use libbpf_rs::{query::ProgInfoIter, Iter, Link};
+use ratatui::widgets::ScrollbarState;
 use ratatui::widgets::TableState;
 use std::{
     collections::HashMap,
@@ -33,9 +38,11 @@ use tui_input::Input;
 pub struct App {
     pub mode: Mode,
     pub table_state: TableState,
+    pub vertical_scroll: usize,
+    pub vertical_scroll_state: ScrollbarState,
     pub header_columns: [String; 7],
     pub items: Arc<Mutex<Vec<BpfProgram>>>,
-    pub data_buf: Arc<Mutex<CircularBuffer<20, PeriodMeasure>>>,
+    pub data_buf: Arc<Mutex<FixedCircularBuffer<PeriodMeasure, 20>>>,
     pub max_cpu: f64,
     pub max_eps: i64,
     pub max_runtime: u64,
@@ -43,6 +50,7 @@ pub struct App {
     pub selected_column: Option<usize>,
     pub graphs_bpf_program: Arc<Mutex<Option<BpfProgram>>>,
     sorted_column: Arc<Mutex<SortColumn>>,
+    delay_seconds: u64,
 }
 
 pub struct PeriodMeasure {
@@ -102,10 +110,7 @@ fn get_pid_map(link: &Option<Link>) -> HashMap<u32, Vec<Process>> {
                         comm: String::from_utf8_lossy(&pid_entry.comm).to_string(),
                     };
 
-                    pid_map
-                        .entry(pid_entry.id)
-                        .or_default()
-                        .push(process);
+                    pid_map.entry(pid_entry.id).or_default().push(process);
                 }
                 Err(e) => {
                     error!("Failed to read from iterator: {}", e);
@@ -119,9 +124,11 @@ fn get_pid_map(link: &Option<Link>) -> HashMap<u32, Vec<Process>> {
 }
 
 impl App {
-    pub fn new() -> App {
+    pub fn new(delay_seconds: u64) -> App {
         let mut app = App {
             mode: Mode::Table,
+            vertical_scroll: 0,
+            vertical_scroll_state: ScrollbarState::new(0),
             table_state: TableState::default(),
             header_columns: [
                 String::from("ID"),
@@ -133,7 +140,7 @@ impl App {
                 String::from("Total CPU %"),
             ],
             items: Arc::new(Mutex::new(vec![])),
-            data_buf: Arc::new(Mutex::new(CircularBuffer::<20, PeriodMeasure>::new())),
+            data_buf: Arc::new(Mutex::new(FixedCircularBuffer::<PeriodMeasure, 20>::new())),
             max_cpu: 0.0,
             max_eps: 0,
             max_runtime: 0,
@@ -141,6 +148,7 @@ impl App {
             selected_column: None,
             graphs_bpf_program: Arc::new(Mutex::new(None)),
             sorted_column: Arc::new(Mutex::new(SortColumn::NoOrder)),
+            delay_seconds,
         };
         // Default sort column is Total CPU % in descending order
         app.sort_column(SortColumn::Descending(6));
@@ -153,6 +161,7 @@ impl App {
         let filter = Arc::clone(&self.filter_input);
         let sort_col = Arc::clone(&self.sorted_column);
         let graphs_bpf_program = Arc::clone(&self.graphs_bpf_program);
+        let delay_seconds = self.delay_seconds;
 
         thread::spawn(move || loop {
             let loop_start = Instant::now();
@@ -179,16 +188,19 @@ impl App {
                     continue;
                 }
 
+                let processes = pid_map.get(&prog.id).cloned().unwrap_or_default();
+
                 // Skip bpf program if it does not match filter
-                let bpf_type = prog.ty.to_string();
+                let bpf_type = program_type_as_str(&prog.ty);
                 if !filter_str.is_empty()
                     && !bpf_type.to_lowercase().contains(&filter_str)
                     && !prog_name.to_lowercase().contains(&filter_str)
+                    && !processes
+                        .iter()
+                        .any(|p| p.comm.to_lowercase().contains(&filter_str))
                 {
                     continue;
                 }
-
-                let processes = pid_map.get(&prog.id).cloned().unwrap_or_default();
 
                 let mut bpf_program = BpfProgram {
                     id: prog.id,
@@ -228,7 +240,7 @@ impl App {
             match *sort_col {
                 SortColumn::Ascending(col_idx) | SortColumn::Descending(col_idx) => {
                     match col_idx {
-                        1 => items.sort_unstable_by(|a, b| a.bpf_type.cmp(&b.bpf_type)),
+                        1 => items.sort_unstable_by(|a, b| a.bpf_type.cmp(b.bpf_type)),
                         2 => items.sort_unstable_by(|a, b| a.name.cmp(&b.name)),
                         3 => items.sort_unstable_by(|a, b| {
                             a.period_average_runtime_ns()
@@ -259,12 +271,12 @@ impl App {
             drop(items);
             drop(sort_col);
 
-            // Adjust sleep duration to maintain a 1-second sample period, accounting for loop processing time.
+            // Adjust sleep duration to maintain a delay_seconds sample period, accounting for loop processing time.
             let elapsed = loop_start.elapsed();
-            let sleep = if elapsed > Duration::from_secs(1) {
-                Duration::from_secs(1)
+            let sleep = if elapsed > Duration::from_secs(delay_seconds) {
+                Duration::from_secs(delay_seconds)
             } else {
-                Duration::from_secs(1) - elapsed
+                Duration::from_secs(delay_seconds) - elapsed
             };
             thread::sleep(sleep);
         });
@@ -276,8 +288,10 @@ impl App {
         self.max_eps = 0;
         self.max_runtime = 0;
         self.mode = Mode::Graph;
-        *self.graphs_bpf_program.lock().unwrap() = self.selected_program().clone();
-
+        self.graphs_bpf_program
+            .lock()
+            .unwrap()
+            .clone_from(&self.selected_program());
     }
 
     pub fn show_table(&mut self) {
@@ -299,35 +313,39 @@ impl App {
 
     pub fn next_program(&mut self) {
         let items = self.items.lock().unwrap();
-        if items.len() > 0 {
+        if !items.is_empty() {
             let i = match self.table_state.selected() {
                 Some(i) => {
                     if i >= items.len() - 1 {
-                        0
+                        items.len() - 1
                     } else {
+                        self.vertical_scroll = self.vertical_scroll.saturating_add(1);
                         i + 1
                     }
                 }
                 None => 0,
             };
             self.table_state.select(Some(i));
+            self.vertical_scroll_state = self.vertical_scroll_state.position(self.vertical_scroll);
         }
     }
 
     pub fn previous_program(&mut self) {
         let items = self.items.lock().unwrap();
-        if items.len() > 0 {
+        if !items.is_empty() {
             let i = match self.table_state.selected() {
                 Some(i) => {
                     if i == 0 {
-                        items.len() - 1
+                        0
                     } else {
+                        self.vertical_scroll = self.vertical_scroll.saturating_sub(1);
                         i - 1
                     }
                 }
-                None => items.len() - 1,
+                None => return, // do nothing if table_state == None && previous_program() called
             };
             self.table_state.select(Some(i));
+            self.vertical_scroll_state = self.vertical_scroll_state.position(self.vertical_scroll);
         }
     }
 
@@ -430,7 +448,7 @@ mod tests {
 
     #[test]
     fn test_next_program_with_empty() {
-        let mut app = App::new();
+        let mut app = App::new(1);
 
         // Initially no item is selected
         assert_eq!(app.selected_program(), None);
@@ -442,10 +460,10 @@ mod tests {
 
     #[test]
     fn test_next_program() {
-        let mut app = App::new();
+        let mut app = App::new(1);
         let prog_1 = BpfProgram {
             id: 1,
-            bpf_type: "test".to_string(),
+            bpf_type: "test",
             name: "test".to_string(),
             prev_runtime_ns: 100,
             run_time_ns: 200,
@@ -458,7 +476,7 @@ mod tests {
 
         let prog_2 = BpfProgram {
             id: 2,
-            bpf_type: "test".to_string(),
+            bpf_type: "test",
             name: "test".to_string(),
             prev_runtime_ns: 100,
             run_time_ns: 200,
@@ -474,39 +492,94 @@ mod tests {
         app.items.lock().unwrap().push(prog_2.clone());
 
         // Initially no item is selected
-        assert_eq!(app.selected_program(), None);
+        assert_eq!(app.selected_program(), None, "expected no program");
+        assert_eq!(
+            app.vertical_scroll, 0,
+            "expected init with 0, got: {}",
+            app.vertical_scroll
+        );
 
         // After calling next, the first item should be selected
         app.next_program();
-        assert_eq!(app.selected_program(), Some(prog_1.clone()));
+        assert_eq!(
+            app.selected_program(),
+            Some(prog_1.clone()),
+            "expected prog_1"
+        );
+        assert_eq!(
+            app.vertical_scroll, 0,
+            "expected scroll 0, got: {}",
+            app.vertical_scroll
+        );
 
         // After calling next again, the second item should be selected
         app.next_program();
-        assert_eq!(app.selected_program(), Some(prog_2.clone()));
+        assert_eq!(
+            app.selected_program(),
+            Some(prog_2.clone()),
+            "expected prog_2"
+        );
+        assert_eq!(
+            app.vertical_scroll, 1,
+            "expected scroll 1, got: {}",
+            app.vertical_scroll
+        );
 
-        // After calling next again, we should wrap around to the first item
+        // After calling next again, the second item should still be selected without wrapping
         app.next_program();
-        assert_eq!(app.selected_program(), Some(prog_1.clone()));
+        assert_eq!(
+            app.selected_program(),
+            Some(prog_2.clone()),
+            "expected prog_2; no wrap around"
+        );
+        assert_eq!(
+            app.vertical_scroll, 1,
+            "expected scroll 1, got: {}",
+            app.vertical_scroll
+        );
     }
 
     #[test]
     fn test_previous_program_with_empty() {
-        let mut app = App::new();
+        let mut app = App::new(1);
 
         // Initially no item is selected
         assert_eq!(app.selected_program(), None);
 
+        // Initially ScrollbarState is 0
+        assert_eq!(
+            app.vertical_scroll_state,
+            ScrollbarState::new(0),
+            "unexpected ScrollbarState"
+        );
+        assert_eq!(
+            app.vertical_scroll, 0,
+            "expected 0 vertical_scroll, got: {}",
+            app.vertical_scroll
+        );
+
         // After calling previous, no item should be selected
         app.previous_program();
         assert_eq!(app.selected_program(), None);
+
+        assert_eq!(
+            app.vertical_scroll_state,
+            ScrollbarState::new(0),
+            "unexpected ScrollbarState"
+        );
+        assert_eq!(
+            app.vertical_scroll, 0,
+            "expected 0 vertical_scroll, got: {}",
+            app.vertical_scroll
+        );
     }
 
     #[test]
     fn test_previous_program() {
-        let mut app = App::new();
+        let mut app = App::new(1);
         let prog_1 = BpfProgram {
             id: 1,
-            bpf_type: "test".to_string(),
+            bpf_type: "test",
             name: "test".to_string(),
             prev_runtime_ns: 100,
             run_time_ns: 200,
@@ -519,7 +592,7 @@ mod tests {
 
         let prog_2 = BpfProgram {
             id: 2,
-            bpf_type: "test".to_string(),
+            bpf_type: "test",
             name: "test".to_string(),
             prev_runtime_ns: 100,
             run_time_ns: 200,
@@ -535,24 +608,40 @@ mod tests {
         app.items.lock().unwrap().push(prog_2.clone());
 
         // Initially no item is selected
-        assert_eq!(app.selected_program(), None);
+        assert_eq!(app.selected_program(), None, "expected no program");
+        assert_eq!(app.vertical_scroll, 0, "expected init with 0");
 
-        // After calling previous, the last item should be selected
+        // After calling previous with no table state, nothing should be selected
         app.previous_program();
-        assert_eq!(app.selected_program(), Some(prog_2.clone()));
+        assert_eq!(app.selected_program(), None, "expected None");
+        assert_eq!(app.vertical_scroll, 0, "still 0, no wrapping");
 
-        // After calling previous again, the first item should be selected
+        // After calling previous again, still nothing should be selected
         app.previous_program();
-        assert_eq!(app.selected_program(), Some(prog_1.clone()));
+        assert_eq!(app.selected_program(), None, "still None");
+        assert_eq!(app.vertical_scroll, 0, "still 0, no wrapping");
 
-        // After calling previous again, we should wrap around to the last item
+        app.next_program(); // populate table state and expect prog_1 selected
+        assert_eq!(
+            app.selected_program(),
+            Some(prog_1.clone()),
+            "expected prog_1"
+        );
+        assert_eq!(app.vertical_scroll, 0, "expected scroll 0");
+
+        // After calling previous again, prog_1 should still be selected (0th index)
         app.previous_program();
-        assert_eq!(app.selected_program(), Some(prog_2.clone()));
+        assert_eq!(
+            app.selected_program(),
+            Some(prog_1.clone()),
+            "still expecting prog_1"
+        );
+        assert_eq!(app.vertical_scroll, 0, "still 0, no wrapping");
     }
 
     #[test]
     fn test_toggle_graphs() {
-        let mut app = App::new();
+        let mut app = App::new(1);
 
         // Initially, UI should be in table mode
         assert_eq!(app.mode, Mode::Table);
